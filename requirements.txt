@@ -1,4 +1,4 @@
-# Only needed for the venv route; on Arch prefer:
+# Windows: setup-windows.bat installs these. Arch: prefer
 #   sudo pacman -S --needed ffmpeg python-numpy python-opencv pyside6 mpv
 numpy>=1.24
 opencv-python-headless>=4.7

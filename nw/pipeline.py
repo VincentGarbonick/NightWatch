@@ -10,6 +10,7 @@ from typing import Callable
 
 from .detector import Cancelled, FileResult, Settings, analyze
 from .export import build_compilation, new_run_dir, write_reports
+from . import system
 from .media import VIDEO_EXTS, require_tools
 
 
@@ -52,8 +53,10 @@ class RunOutput:
 
 def run(files: list[str], S: Settings, outdir: str, cb: Callbacks | None = None,
         cancel: threading.Event | None = None, debug_video: bool = False) -> RunOutput:
-    require_tools()
     cb = cb or Callbacks()
+    for w in system.configure(S.platform or None, S.ffmpeg_dir):
+        cb.log("WARNING: " + w)
+    require_tools()
     cancel = cancel or threading.Event()
     run_dir = new_run_dir(outdir)
     out = RunOutput(run_dir)
@@ -63,7 +66,8 @@ def run(files: list[str], S: Settings, outdir: str, cb: Callbacks | None = None,
 
     def job(i: int, path: str) -> tuple[int, FileResult]:
         dbg = str(run_dir / f"debug_{Path(path).stem}.mp4") if debug_video else None
-        r = analyze(path, S, progress=lambda f: cb.file_progress(i, f), cancel=cancel, debug_video=dbg)
+        r = analyze(path, S, progress=lambda f: cb.file_progress(i, f), cancel=cancel, debug_video=dbg,
+                    log=cb.log)
         return i, r
 
     try:
@@ -80,7 +84,7 @@ def run(files: list[str], S: Settings, outdir: str, cb: Callbacks | None = None,
                 else:
                     speed = (r.info.duration / r.elapsed) if r.elapsed > 0 and r.info else 0
                     cb.log(f"{Path(r.path).name}: {len(r.events)} event(s)  "
-                           f"[{r.elapsed:.1f}s, {speed:.0f}x realtime"
+                           f"[{r.elapsed:.1f}s, {speed:.0f}x realtime, {r.decoder}"
                            + (f", auto-ignored {r.suppressed_pct:.1f}% of frame" if r.suppressed_pct >= 0.5 else "")
                            + "]")
                 cb.file_done(i, r)

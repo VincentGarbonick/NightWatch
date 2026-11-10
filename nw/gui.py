@@ -9,25 +9,25 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QPainter, QPalette, QPen,
+from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFontDatabase, QIcon, QPainter, QPalette, QPen,
                            QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                               QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QProgressBar, QPushButton, QRadioButton, QSlider,
                                QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
-from . import __version__
+from . import __version__, gpu, system
 from .detector import FileResult, Settings
 from .export import clock_str
-from .media import (MediaError, VIDEO_EXTS, clock_from_filename, fmt_hms, grab_frame, player_command,
+from .media import (MediaError, VIDEO_EXTS, clock_from_filename, fmt_hms, grab_frame,
                     probe, require_tools)
 from .pipeline import Callbacks, default_jobs, expand_inputs, run
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "nightwatch"
+CONFIG_DIR = system.config_dir()
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
 
@@ -177,6 +177,143 @@ class RegionDialog(QDialog):
         return self.canvas.regions
 
 
+# --------------------------------------------------------------------------- platform / GPU setup
+
+
+class _Done(QObject):
+    done = Signal(object)
+
+
+class SetupDialog(QDialog):
+    """Shown at startup: pick the operating system, graphics card and (optionally) ffmpeg folder."""
+
+    def __init__(self, parent, S: Settings):
+        super().__init__(parent)
+        self.setWindowTitle("Nightwatch setup")
+        self.S = S
+        lay = QVBoxLayout(self)
+        lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        intro = QLabel("Choose the system you're on and the graphics card to use. The GPU speeds up "
+                       "decoding during scans and encoding of the compilation. If it can't be used for "
+                       "a file, Nightwatch quietly falls back to the CPU, so results never depend on it.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        form = QFormLayout()
+        det = system.detected_platform()
+        osrow = QHBoxLayout()
+        self.os_win = QRadioButton("Windows" + ("  (detected)" if det == "windows" else ""))
+        self.os_lin = QRadioButton("Linux" + ("  (detected)" if det == "linux" else ""))
+        grp = QButtonGroup(self)
+        grp.addButton(self.os_win)
+        grp.addButton(self.os_lin)
+        (self.os_win if (S.platform or det) == "windows" else self.os_lin).setChecked(True)
+        osrow.addWidget(self.os_win)
+        osrow.addWidget(self.os_lin)
+        osrow.addStretch(1)
+        form.addRow("Operating system", osrow)
+        self.os_warn = QLabel()
+        self.os_warn.setObjectName("warn")
+        self.os_warn.setWordWrap(True)
+        form.addRow("", self.os_warn)
+        self.gpu_box = QComboBox()
+        for v in gpu.VENDORS:
+            self.gpu_box.addItem(gpu.VENDOR_LABELS[v], v)
+        self.gpu_box.setCurrentIndex(max(0, list(gpu.VENDORS).index(S.gpu) if S.gpu in gpu.VENDORS else 0))
+        form.addRow("Graphics card", self.gpu_box)
+        frow = QHBoxLayout()
+        self.ffdir = QLineEdit(S.ffmpeg_dir)
+        self.ffdir.setPlaceholderText("found automatically (PATH, winget, scoop, …)")
+        b = QPushButton("Browse…")
+        b.clicked.connect(self._browse)
+        frow.addWidget(self.ffdir, 1)
+        frow.addWidget(b)
+        form.addRow("ffmpeg folder", frow)
+        self.ff_status = QLabel()
+        self.ff_status.setObjectName("dim")
+        self.ff_status.setWordWrap(True)
+        self.ff_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("", self.ff_status)
+        lay.addLayout(form)
+
+        trow = QHBoxLayout()
+        self.btn_test = QPushButton("Test graphics card")
+        self.btn_test.clicked.connect(self._test)
+        self.test_status = QLabel()
+        self.test_status.setObjectName("dim")
+        trow.addWidget(self.btn_test)
+        trow.addWidget(self.test_status, 1)
+        lay.addLayout(trow)
+        self.report = QPlainTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.report.setMinimumHeight(190)
+        self.report.setVisible(False)
+        lay.addWidget(self.report, 1)
+
+        self.show_again = QCheckBox("Show this window every time Nightwatch starts")
+        self.show_again.setChecked(S.show_setup)
+        lay.addWidget(self.show_again)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        self._sig = _Done()
+        self._sig.done.connect(self._test_done)
+        self.os_win.toggled.connect(self._update)
+        self.ffdir.editingFinished.connect(self._update)
+        self.gpu_box.currentIndexChanged.connect(lambda *_: self.report.setVisible(False))
+        self.resize(640, 360)
+        self._update()
+
+    def platform(self) -> str:
+        return "windows" if self.os_win.isChecked() else "linux"
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Folder containing ffmpeg", self.ffdir.text() or str(Path.home()))
+        if d:
+            self.ffdir.setText(d)
+            self._update()
+
+    def _update(self, *_):
+        warns = system.configure(self.platform(), self.ffdir.text())
+        self.os_warn.setText(warns[0] if warns else "")
+        self.os_warn.setVisible(bool(warns))
+        path, ver = system.tool("ffmpeg"), system.ffmpeg_version()
+        if path and ver:
+            self.ff_status.setText(f"ffmpeg: {path}\n{ver.split(' Copyright')[0]}")
+        else:
+            self.ff_status.setText("ffmpeg was not found. " + system.install_hint())
+        self.report.setVisible(False)
+
+    def _test(self):
+        self._update()
+        vendor = self.gpu_box.currentData()
+        self.btn_test.setEnabled(False)
+        self.test_status.setText("Testing… (a few seconds)")
+        threading.Thread(target=lambda: self._sig.done.emit(gpu.check(vendor)), daemon=True).start()
+
+    def _test_done(self, rep):
+        self.btn_test.setEnabled(True)
+        self.report.setPlainText("\n".join(rep.lines()))
+        self.report.setVisible(True)
+        self.layout().activate()
+        self.resize(max(self.width(), 680), max(self.height(), self.sizeHint().height() + 40))
+        gpu_dec = rep.chosen_decoder not in ("", "CPU")
+        gpu_enc = not rep.chosen_encoder.startswith("CPU")
+        if gpu_dec or gpu_enc:
+            self.test_status.setText("GPU will be used for: " + " and ".join(
+                [x for x, on in (("decoding", gpu_dec), ("encoding", gpu_enc)) if on]))
+        else:
+            self.test_status.setText("No usable GPU path; everything will run on the CPU.")
+
+    def apply(self):
+        self.S.platform = self.platform()
+        self.S.gpu = self.gpu_box.currentData()
+        self.S.ffmpeg_dir = self.ffdir.text().strip()
+        self.S.show_setup = self.show_again.isChecked()
+
+
 # --------------------------------------------------------------------------- main window
 
 Q_FILE, Q_START, Q_LEN, Q_RES, Q_STATUS, Q_EVENTS = range(6)
@@ -214,7 +351,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_settings_to_ui()
-        self.resize(1180, 860)
+        system.configure(self.settings.platform or None, self.settings.ffmpeg_dir)
+        self._update_system_label()
+        self.resize(1180, 900)
+        if self.settings.show_setup or not self.settings.platform:
+            QTimer.singleShot(0, self._open_setup)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -228,6 +369,7 @@ class MainWindow(QMainWindow):
         left.setFixedWidth(430)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(self._build_system_box())
         ll.addWidget(self._build_detection_box())
         ll.addWidget(self._build_output_box())
         ll.addStretch(1)
@@ -333,6 +475,38 @@ class MainWindow(QMainWindow):
         root.addWidget(right, 1)
         self.setCentralWidget(central)
 
+    def _build_system_box(self) -> QGroupBox:
+        box = QGroupBox("System")
+        row = QHBoxLayout(box)
+        self.sys_lbl = QLabel()
+        self.sys_lbl.setWordWrap(True)
+        b = QPushButton("Change…")
+        b.clicked.connect(lambda: self._open_setup())
+        row.addWidget(self.sys_lbl, 1)
+        row.addWidget(b)
+        return box
+
+    def _update_system_label(self):
+        S = self.settings
+        ok = system.tool("ffmpeg") is not None
+        plat = (S.platform or system.detected_platform()).title()
+        txt = f"{plat}  ·  GPU: {gpu.VENDOR_LABELS.get(S.gpu, S.gpu)}  ·  ffmpeg " + ("found" if ok else "MISSING")
+        if S.platform and S.platform != system.detected_platform():
+            txt += "\n(this computer looks like " + system.detected_platform().title() + ")"
+        self.sys_lbl.setText(txt)
+        self.sys_lbl.setStyleSheet("" if ok else "color:#ff8a80")
+
+    def _open_setup(self):
+        dlg = SetupDialog(self, self.settings)
+        if dlg.exec():
+            dlg.apply()
+        elif not self.settings.platform:
+            self.settings.platform = system.detected_platform()
+        for w in system.configure(self.settings.platform, self.settings.ffmpeg_dir):
+            self._log("WARNING: " + w)
+        self._save_settings()
+        self._update_system_label()
+
     def _build_detection_box(self) -> QGroupBox:
         box = QGroupBox("Detection")
         form = QFormLayout(box)
@@ -387,7 +561,6 @@ class MainWindow(QMainWindow):
         self.clock = QComboBox(); self.clock.addItems(["auto", "filename", "mtime", "none"])
         self.clock.setToolTip("Where the real time comes from: the file name (MediaMTX / most NVRs), "
                               "the file's modified time minus its length, or nothing.")
-        self.hw = QCheckBox("GPU decode")
         self.debug = QCheckBox("Write debug videos")
         self.debug.setToolTip("Writes a side-by-side video per file: picture | detection mask | "
                               "learnt 'always changing' map. Useful for tuning.")
@@ -397,8 +570,7 @@ class MainWindow(QMainWindow):
         for i, (lbl, w) in enumerate(items):
             g.addWidget(QLabel(lbl), i, 0)
             g.addWidget(w, i, 1)
-        g.addWidget(self.hw, len(items), 0)
-        g.addWidget(self.debug, len(items), 1)
+        g.addWidget(self.debug, len(items), 0, 1, 2)
         self.adv.setVisible(False)
         self.adv_btn.toggled.connect(lambda on: (self.adv.setVisible(on),
                                                  self.adv_btn.setText("Advanced ▾" if on else "Advanced ▸")))
@@ -454,9 +626,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ settings
     def _load_settings(self) -> Settings:
         S = Settings(jobs=default_jobs())
-        self._outdir_saved = str(Path.home() / "Videos" / "nightwatch")
+        self._outdir_saved = str(system.default_output_dir())
         try:
-            d = json.loads(CONFIG_FILE.read_text())
+            d = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             self._outdir_saved = d.pop("_outdir", self._outdir_saved)
             S = Settings.from_dict(d)
         except (OSError, ValueError):
@@ -468,7 +640,7 @@ class MainWindow(QMainWindow):
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             d = self.settings.to_dict()
             d["_outdir"] = self.outdir.text()
-            CONFIG_FILE.write_text(json.dumps(d, indent=2))
+            CONFIG_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
         except OSError:
             pass
 
@@ -486,7 +658,6 @@ class MainWindow(QMainWindow):
         self.gap.setValue(S.merge_gap_s)
         self.jobs.setValue(S.jobs)
         self.clock.setCurrentText(S.clock_source)
-        self.hw.setChecked(S.hwaccel)
         self.outdir.setText(self._outdir_saved)
         (self.mode_comp if S.mode == "compile" else self.mode_ts).setChecked(True)
         self.pre.setValue(S.pre_roll_s)
@@ -511,7 +682,6 @@ class MainWindow(QMainWindow):
         S.merge_gap_s = self.gap.value()
         S.jobs = self.jobs.value()
         S.clock_source = self.clock.currentText()
-        S.hwaccel = self.hw.isChecked()
         S.mode = "compile" if self.mode_comp.isChecked() else "timestamps"
         S.pre_roll_s = self.pre.value()
         S.post_roll_s = self.post.value()
@@ -659,7 +829,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "ffmpeg missing", str(e))
             return
         S = self._ui_to_settings()
-        outdir = self.outdir.text().strip() or str(Path.home() / "Videos" / "nightwatch")
+        outdir = self.outdir.text().strip() or str(system.default_output_dir())
         self.outdir.setText(outdir)
         self._save_settings()
         self.results.clear()
@@ -734,8 +904,8 @@ class MainWindow(QMainWindow):
             st.setForeground(QColor(255, 138, 128))
         else:
             spd = (r.info.duration / r.elapsed) if r.elapsed > 0 else 0
-            st.setText(f"done · {spd:.0f}× realtime")
-            st.setToolTip("")
+            st.setText(f"done · {spd:.0f}× realtime" + (" · GPU" if r.decoder != "CPU" else ""))
+            st.setToolTip(f"Decoded with: {r.decoder}")
             st.setForeground(QColor(140, 200, 150))
         self.queue.item(i, Q_EVENTS).setText("!" if r.error else str(len(r.events)))
         for ev in r.events:
@@ -789,12 +959,17 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ playback
     def _launch(self, path: str, t: float = 0.0):
-        cmd = player_command(path, t)
+        cmd = system.player_command(path, t)
         if cmd is None:
-            QMessageBox.information(self, "No player", "Install mpv to play clips: sudo pacman -S mpv")
+            if system.open_with_default_app(path):
+                self.status.setText("Opened in your default player. Install mpv or VLC to jump straight "
+                                    "to the event.")
+                return
+            hint = ("winget install VideoLAN.VLC" if system.is_windows() else "sudo pacman -S mpv")
+            QMessageBox.information(self, "No player", f"Install mpv or VLC to play clips:  {hint}")
             return
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **system.detached_kw())
         except OSError as e:
             QMessageBox.warning(self, "Could not start player", str(e))
 
@@ -828,7 +1003,7 @@ class MainWindow(QMainWindow):
 
     def _open_folder(self):
         if self.last_out:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_out.run_dir)))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_out.run_dir.resolve())))
 
     def _open_report(self):
         if self.last_out and self.last_out.reports:
@@ -854,6 +1029,7 @@ class MainWindow(QMainWindow):
 
 STYLE = """
 QLabel#dim { color: #8b9098; }
+QLabel#warn { color: #ffb74d; }
 QToolButton#link { border: none; color: #8fb3ff; padding: 0; }
 QGroupBox { border: 1px solid #33373e; border-radius: 6px; margin-top: 12px; padding: 8px 6px 6px 6px; }
 QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #c8ccd2; font-weight: 600; }

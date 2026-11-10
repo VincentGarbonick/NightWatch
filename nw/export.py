@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Callable
 
 from .detector import Cancelled, Event, FileResult, Settings
-from .media import ProbeInfo, drawtext_available, fmt_hms
+from . import gpu, system
+from .media import ProbeInfo, fmt_hms, overlay_font
 
 # --------------------------------------------------------------------------- helpers
 
@@ -93,11 +94,12 @@ def plan_segments(results: list[FileResult], S: Settings) -> list[Segment]:
 
 
 def _probe_duration(p: Path) -> float:
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                          "-of", "default=nw=1:nk=1", str(p)], capture_output=True, text=True)
     try:
+        out = subprocess.run([system.ffprobe(), "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", str(p)], capture_output=True, timeout=60,
+                             **system.TEXT, **system.popen_kw())
         return float(out.stdout.strip())
-    except ValueError:
+    except (ValueError, OSError, subprocess.TimeoutExpired):
         return 0.0
 
 
@@ -115,8 +117,12 @@ def _target_format(segs: list[Segment]) -> tuple[int, int, int]:
     return w, h, max(5, min(30, fps))
 
 
-def _run(cmd: list[str], cancel: threading.Event | None, procs: list) -> tuple[int, str]:
-    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+def _run(cmd: list[str], cancel: threading.Event | None, procs: list, cwd: Path | None = None) -> tuple[int, str]:
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=cwd,
+                             **system.TEXT, **system.popen_kw())
+    except OSError as e:
+        return -1, str(e)
     procs.append(p)
     try:
         while True:
@@ -132,8 +138,14 @@ def _run(cmd: list[str], cancel: threading.Event | None, procs: list) -> tuple[i
         procs.remove(p)
 
 
+def _safe_name(s: str) -> str:
+    return "".join("-" if c in '<>:"/\\|?*' else c for c in s).strip(" .")
+
+
 def _encode_segment(seg: Segment, i: int, n: int, tmp: Path, S: Settings, W: int, H: int, FPS: int,
-                    use_text: bool, cancel, procs) -> tuple[Segment, str | None]:
+                    use_text: bool, font_opt: str, enc: gpu.Encoder, cancel, procs) -> tuple[Segment, str | None]:
+    """Cut and re-encode one clip. ffmpeg runs *inside* tmp and the filter graph only
+    uses relative file names, so Windows drive letters never need escaping."""
     src = seg.result.path
     dur = max(0.2, seg.end - seg.start)
     pre = max(0.0, seg.start - 15.0)        # .ts seeking can land late; seek early, trim precisely
@@ -144,7 +156,7 @@ def _encode_segment(seg: Segment, i: int, n: int, tmp: Path, S: Settings, W: int
     if S.brighten_output:
         vf.append("eq=gamma=1.6")
     if use_text:
-        tf = tmp / f"seg_{i:05d}.txt"
+        tname = f"seg_{i:05d}.txt"
         name = Path(src).name
         line1 = f"{name}   event {i}/{n}   [{seg.kind}]"
         if seg.clock is not None:
@@ -153,20 +165,20 @@ def _encode_segment(seg: Segment, i: int, n: int, tmp: Path, S: Settings, W: int
                      f"     file pos%{{pts:hms:{seg.start:.3f}}}")
         else:
             line2 = f"file pos%{{pts:hms:{seg.start:.3f}}}"
-        tf.write_text(_dt_escape(line1) + "\n" + line2)
+        (tmp / tname).write_text(_dt_escape(line1) + "\n" + line2, encoding="utf-8")
         fs = max(14, H // 30)
-        vf.append(f"drawtext=textfile={tf}:fontcolor=white:fontsize={fs}:box=1:boxcolor=black@0.55:"
-                  f"boxborderw={max(4, fs // 3)}:line_spacing={max(2, fs // 5)}:x={fs // 2}:y=h-th-{fs}")
-    vf.append("format=yuv420p")
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    if S.hwaccel:
-        cmd += ["-hwaccel", "auto"]
+        vf.append(f"drawtext=textfile={tname}{font_opt}:fontcolor=white:fontsize={fs}:box=1:"
+                  f"boxcolor=black@0.55:boxborderw={max(4, fs // 3)}:line_spacing={max(2, fs // 5)}:"
+                  f"x={fs // 2}:y=h-th-{fs}")
+    vf.append(enc.out_filter)
+    cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+           *enc.global_args, *enc.decode_args]
     if pre > 0:
         cmd += ["-ss", f"{pre:.3f}"]
     cmd += ["-fflags", "+discardcorrupt", "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn",
-            "-vf", ",".join(vf), "-c:v", "libx264", "-preset", "veryfast", "-crf", str(S.crf),
-            "-g", str(FPS * 2), "-video_track_timescale", "90000", str(out)]
-    rc, err = _run(cmd, cancel, procs)
+            "-vf", ",".join(vf), *enc.codec_args(S.crf, FPS * 2),
+            "-video_track_timescale", "90000", out.name]
+    rc, err = _run(cmd, cancel, procs, cwd=tmp)
     if rc != 0 or not out.exists():
         return seg, f"{Path(src).name} @ {fmt_hms(seg.start)}: {err.strip()[-300:]}"
     seg.file = out
@@ -175,11 +187,11 @@ def _encode_segment(seg: Segment, i: int, n: int, tmp: Path, S: Settings, W: int
 
 def _copy_segment(seg: Segment, i: int, tmp: Path, cancel, procs) -> tuple[Segment, str | None]:
     out = tmp / f"seg_{i:05d}.ts"
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
            "-ss", f"{seg.start:.3f}", "-i", seg.result.path, "-t", f"{seg.end - seg.start:.3f}",
            "-map", "0:v:0", "-an", "-sn", "-dn", "-c", "copy", "-avoid_negative_ts", "make_zero",
-           "-f", "mpegts", str(out)]
-    rc, err = _run(cmd, cancel, procs)
+           "-f", "mpegts", out.name]
+    rc, err = _run(cmd, cancel, procs, cwd=tmp)
     if rc != 0 or not out.exists():
         return seg, f"{Path(seg.result.path).name} @ {fmt_hms(seg.start)}: {err.strip()[-300:]}"
     seg.file = out
@@ -190,6 +202,39 @@ def _meta_escape(s: str) -> str:
     for ch in ("\\", "=", ";", "#", "\n"):
         s = s.replace(ch, "\\" + ch)
     return s
+
+
+def _cut_all(segs, tmp, S, W, H, FPS, use_text, font_opt, enc, fast, cancel, procs, progress, log):
+    for s in segs:
+        s.file = None
+    errors = []
+    n = len(segs)
+    done = 0
+    # NVENC/AMF/QSV sessions are cheap but finite; 2-3 parallel clips is plenty either way.
+    workers = max(1, min(3, (os.cpu_count() or 2) // 2))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = []
+            for i, seg in enumerate(segs, 1):
+                if fast:
+                    futs.append(ex.submit(_copy_segment, seg, i, tmp, cancel, procs))
+                else:
+                    futs.append(ex.submit(_encode_segment, seg, i, n, tmp, S, W, H, FPS, use_text, font_opt,
+                                          enc, cancel, procs))
+            for f in as_completed(futs):
+                seg, err = f.result()
+                if err:
+                    errors.append(err)
+                done += 1
+                if progress:
+                    progress(0.9 * done / n)
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+    except Cancelled:
+        for p in list(procs):
+            p.kill()
+        raise
+    return errors
 
 
 def build_compilation(results: list[FileResult], run_dir: Path, S: Settings,
@@ -208,41 +253,37 @@ def build_compilation(results: list[FileResult], run_dir: Path, S: Settings,
             log("Fast mode needs every file to share codec and resolution; "
                 f"found {len(sig)} variants, re-encoding instead.")
             fast = False
-    use_text = S.overlay and not fast and drawtext_available()
-    if S.overlay and not fast and not use_text:
-        log("ffmpeg drawtext is unavailable (no freetype/fonts?), so the compilation has no text overlay.")
-    W, H, FPS = _target_format(segs)
     tmp = run_dir / ".tmp_segments"
     tmp.mkdir(exist_ok=True)
+    font_opt = ""
+    use_text = False
+    if S.overlay and not fast:
+        font = overlay_font()
+        if font is None:
+            log("ffmpeg can't draw text here (no freetype or no usable font), so the compilation "
+                "has no text overlay.")
+        else:
+            use_text = True
+            if font[0] == "file":
+                shutil.copyfile(font[1], tmp / "font.ttf")
+                font_opt = ":fontfile=font.ttf"
+    W, H, FPS = _target_format(segs)
+    enc = gpu.X264 if fast else gpu.choose_encoder(S.gpu, log)
     procs: list = []
-    errors = []
     n = len(segs)
-    done = 0
-    log(f"Cutting {n} clip(s) " + ("(stream copy)" if fast else f"(re-encode {W}x{H}@{FPS})") + "...")
-    workers = max(1, min(3, (os.cpu_count() or 2) // 2))
+    log(f"Cutting {n} clip(s) " + ("(stream copy)" if fast else f"(re-encode {W}x{H}@{FPS}, {enc.label})") + "...")
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = []
-            for i, seg in enumerate(segs, 1):
-                if fast:
-                    futs.append(ex.submit(_copy_segment, seg, i, tmp, cancel, procs))
-                else:
-                    futs.append(ex.submit(_encode_segment, seg, i, n, tmp, S, W, H, FPS, use_text, cancel, procs))
-            for f in as_completed(futs):
-                seg, err = f.result()
-                if err:
-                    errors.append(err)
-                    log("Clip failed: " + err)
-                done += 1
-                if progress:
-                    progress(0.9 * done / n)
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
+        errors = _cut_all(segs, tmp, S, W, H, FPS, use_text, font_opt, enc, fast, cancel, procs, progress, log)
+        if errors and enc.is_gpu:
+            # Clips from different encoders can't be joined losslessly, so redo them all on the CPU.
+            log(f"{enc.label} failed on {len(errors)} clip(s) ({errors[0]}); redoing the compilation on the CPU.")
+            enc = gpu.X264
+            errors = _cut_all(segs, tmp, S, W, H, FPS, use_text, font_opt, enc, fast, cancel, procs, progress, log)
     except Cancelled:
-        for p in list(procs):
-            p.kill()
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    for e in errors:
+        log("Clip failed: " + e)
 
     good = [s for s in segs if s.file is not None]
     if not good:
@@ -250,7 +291,7 @@ def build_compilation(results: list[FileResult], run_dir: Path, S: Settings,
         log("Every clip failed; no compilation was written.")
         return None, segs
 
-    # chapters + concat
+    # chapters + concat (list uses names relative to the list file)
     t = 0.0
     chap = [";FFMETADATA1", "title=Nightwatch event compilation", ""]
     for i, s in enumerate(good, 1):
@@ -261,19 +302,17 @@ def build_compilation(results: list[FileResult], run_dir: Path, S: Settings,
         chap += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(t * 1000)}",
                  f"END={int((t + d) * 1000)}", f"title={_meta_escape(label)}", ""]
         t += d
-    (tmp / "chapters.txt").write_text("\n".join(chap))
-    with open(tmp / "list.txt", "w") as fh:
-        for s in good:
-            fh.write("file '" + str(s.file).replace("'", "'\\''") + "'\n")
+    (tmp / "chapters.txt").write_text("\n".join(chap), encoding="utf-8")
+    (tmp / "list.txt").write_text("".join(f"file '{s.file.name}'\n" for s in good), encoding="utf-8")
     out = run_dir / ("compilation.mkv" if fast else "compilation.mp4")
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "concat", "-safe", "0", "-i", str(tmp / "list.txt"),
-           "-i", str(tmp / "chapters.txt"), "-map", "0:v", "-map_metadata", "1", "-map_chapters", "1",
+    cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "concat", "-safe", "0", "-i", "list.txt",
+           "-i", "chapters.txt", "-map", "0:v", "-map_metadata", "1", "-map_chapters", "1",
            "-c", "copy"]
     if not fast:
         cmd += ["-movflags", "+faststart"]
-    cmd.append(str(out))
-    rc, err = _run(cmd, cancel, procs)
+    cmd.append(str(out.resolve()))
+    rc, err = _run(cmd, cancel, procs, cwd=tmp)
     if rc != 0:
         log("Joining clips failed: " + err.strip()[-400:])
         out = None
@@ -284,14 +323,14 @@ def build_compilation(results: list[FileResult], run_dir: Path, S: Settings,
             stem = (s.clock.strftime("%Y-%m-%d_%H-%M-%S") if s.clock
                     else f"{Path(s.result.path).stem}_{fmt_hms(s.start).replace(':', '-')}")
             kind = s.kind.split(",")[0].replace(" ", "-")
-            dest = cd / f"{stem}_{kind}{s.file.suffix}"
+            dest = cd / _safe_name(f"{stem}_{kind}{s.file.suffix}")
             shutil.move(str(s.file), dest)
             s.file = dest
     shutil.rmtree(tmp, ignore_errors=True)
     if progress:
         progress(1.0)
     if out is not None:
-        log(f"Compilation: {out.name}  ({len(good)} clips, {fmt_hms(t)} long"
+        log(f"Compilation: {out.name}  ({len(good)} clips, {fmt_hms(t)} long, {enc.label}"
             + (f", {len(errors)} failed" if errors else "") + ")")
     return out, segs
 
@@ -332,7 +371,7 @@ def write_reports(results: list[FileResult], run_dir: Path, S: Settings,
                 compilation_s=round(ct, 2) if ct is not None else ""))
 
     csv_p = run_dir / "events.csv"
-    with open(csv_p, "w", newline="") as fh:
+    with open(csv_p, "w", newline="", encoding="utf-8") as fh:
         cols = list(rows[0].keys()) if rows else ["file", "event", "clock_start", "offset_start", "kind"]
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
@@ -348,7 +387,8 @@ def write_reports(results: list[FileResult], run_dir: Path, S: Settings,
                             auto_ignored_pct=round(r.suppressed_pct, 2), seconds=round(r.elapsed, 1)))
     json_p = run_dir / "events.json"
     json_p.write_text(json.dumps(dict(settings=S.to_dict(), files=summary, events=rows,
-                                      compilation=compilation.name if compilation else None), indent=2))
+                                      compilation=compilation.name if compilation else None), indent=2),
+                      encoding="utf-8")
 
     lines = [f"Nightwatch report: {datetime.now():%Y-%m-%d %H:%M}",
              f"{sum(len(r.events) for r in results)} event(s) in {len(results)} file(s)", ""]
@@ -364,10 +404,10 @@ def write_reports(results: list[FileResult], run_dir: Path, S: Settings,
             lines.append("   (nothing detected)")
         lines.append("")
     txt_p = run_dir / "events.txt"
-    txt_p.write_text("\n".join(lines))
+    txt_p.write_text("\n".join(lines), encoding="utf-8")
 
     html_p = run_dir / "report.html"
-    html_p.write_text(_html(results, rows, compilation, run_dir))
+    html_p.write_text(_html(results, rows, compilation, run_dir), encoding="utf-8")
     return dict(csv=csv_p, json=json_p, txt=txt_p, html=html_p)
 
 

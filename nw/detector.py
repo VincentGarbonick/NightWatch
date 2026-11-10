@@ -24,11 +24,13 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable
 
 import cv2
 import numpy as np
 
+from . import gpu, system
 from .media import MediaError, ProbeInfo, file_clock, probe
 
 # --------------------------------------------------------------------------- settings
@@ -48,8 +50,12 @@ class Settings:
     ignore_regions: list = field(default_factory=list)   # [[x, y, w, h], ...] normalised 0-1
     min_event_s: float = 0.8
     merge_gap_s: float = 3.0
-    hwaccel: bool = False
     clock_source: str = "auto"           # auto | filename | mtime | none
+    # platform / hardware
+    platform: str = ""                   # windows | linux ("" = not chosen yet)
+    gpu: str = "auto"                    # auto | nvidia | amd | intel | none
+    ffmpeg_dir: str = ""                 # optional folder containing ffmpeg/ffprobe
+    show_setup: bool = True              # show the platform/GPU window when the GUI starts
     jobs: int = 2                        # files analysed in parallel
     # output
     mode: str = "timestamps"             # timestamps | compile
@@ -133,6 +139,7 @@ class FileResult:
     frames: int = 0
     dark_fraction: float = 0.0
     suppressed_pct: float = 0.0
+    decoder: str = "CPU"
 
 
 class Cancelled(Exception):
@@ -205,6 +212,19 @@ def analyze(path: str, settings: Settings,
 
     S = settings
     afps = max(1.0, min(float(S.analysis_fps), info.fps or 30.0))
+    tw = _even(min(max(640, _even(min(S.analysis_width, info.width)) * 2), info.width))
+    th = _even(tw * info.height / info.width)
+    chain = gpu.choose_decoder(path, info, S.gpu, afps, tw, th, log)
+    res, rc = _analyze_with(path, S, info, clock, chain, t_start, progress, cancel, debug_video)
+    if chain.is_gpu and rc not in (0, None) and (res.error or res.frames < 0.9 * info.duration * afps):
+        if log:
+            log(f"{Path(path).name}: GPU decode ({chain.name}) stopped early; re-running on the CPU.")
+        res, rc = _analyze_with(path, S, info, clock, gpu.CPU_DECODE, t_start, progress, cancel, debug_video)
+    return res
+
+
+def _analyze_with(path, S, info, clock, chain, t_start, progress, cancel, debug_video):
+    afps = max(1.0, min(float(S.analysis_fps), info.fps or 30.0))
     aw = _even(min(S.analysis_width, info.width))
     ah = _even(aw * info.height / info.width)
     tw = _even(min(max(640, aw * 2), info.width))
@@ -212,23 +232,25 @@ def analyze(path: str, settings: Settings,
     frame_bytes = tw * th * 3
     expected = max(1, int(info.duration * afps))
 
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
-    if S.hwaccel:
-        cmd += ["-hwaccel", "auto"]
-    cmd += ["-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", path,
-            "-map", "0:v:0", "-an", "-sn", "-dn",
-            "-vf", f"fps={afps:g},scale={tw}:{th}:flags=area,format=bgr24",
-            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", *chain.input_args,
+           "-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", path,
+           "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", chain.vf(afps, tw, th),
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     errf = tempfile.TemporaryFile()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, bufsize=frame_bytes * 2)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, bufsize=frame_bytes * 2,
+                                **system.popen_kw())
+    except OSError as e:
+        errf.close()
+        return FileResult(path, info, clock, [], error=f"Could not run ffmpeg: {e}"), None
 
     dbg = None
     if debug_video:
         dbg = subprocess.Popen(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
+            [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
              "-pix_fmt", "bgr24", "-s", f"{aw * 3}x{ah}", "-r", f"{afps:g}", "-i", "-",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", debug_video],
-            stdin=subprocess.PIPE)
+            stdin=subprocess.PIPE, **system.popen_kw())
 
     # ---- parameters in analysis pixels / frames
     area_px = aw * ah
@@ -456,11 +478,13 @@ def analyze(path: str, settings: Settings,
             dbg.stdin.close()
             dbg.wait()
 
+    rc = proc.returncode
     if idx == 0:
         errf.seek(0)
         msg = errf.read().decode(errors="replace").strip()[:400]
         errf.close()
-        return FileResult(path, info, clock, [], error="No frames decoded" + (f": {msg}" if msg else ""))
+        return FileResult(path, info, clock, [], error="No frames decoded" + (f": {msg}" if msg else ""),
+                          decoder=chain.name), rc
     errf.close()
 
     done_tracks.extend(t for t in tracks if t.confirmed)
@@ -471,7 +495,7 @@ def analyze(path: str, settings: Settings,
     br = np.asarray(brightness)
     return FileResult(path, info, clock, events, elapsed=time.time() - t_start, frames=idx,
                       dark_fraction=float((br < S.night_threshold).mean()),
-                      suppressed_pct=100.0 * sup_acc / max(1, idx - suppress_after))
+                      suppressed_pct=100.0 * sup_acc / max(1, idx - suppress_after), decoder=chain.name), rc
 
 
 def _thumb(bgr: np.ndarray, boxes, aw: int, ah: int) -> bytes:

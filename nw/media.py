@@ -7,11 +7,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from fractions import Fraction
-from functools import lru_cache
 from pathlib import Path
+
+from . import system
 
 VIDEO_EXTS = {".ts", ".m2ts", ".mts", ".mp4", ".mkv", ".mov", ".avi", ".flv"}
 
@@ -21,10 +23,9 @@ class MediaError(RuntimeError):
 
 
 def require_tools():
-    missing = [t for t in ("ffmpeg", "ffprobe") if shutil.which(t) is None]
+    missing = [t for t in ("ffmpeg", "ffprobe") if system.tool(t) is None]
     if missing:
-        raise MediaError("Missing required tool(s): " + ", ".join(missing) +
-                         ". Install with: sudo pacman -S ffmpeg")
+        raise MediaError("Missing required tool(s): " + ", ".join(missing) + ". " + system.install_hint())
 
 
 @dataclass
@@ -37,6 +38,7 @@ class ProbeInfo:
     codec: str
     video_offset: float      # first video frame time relative to file start
     has_audio: bool
+    pix_fmt: str = ""
 
     @property
     def resolution(self) -> str:
@@ -53,14 +55,16 @@ def _fraction(s: str | None) -> float:
 
 def probe(path: str | os.PathLike) -> ProbeInfo:
     path = str(path)
-    cmd = ["ffprobe", "-v", "error", "-show_entries",
-           "format=duration,start_time:stream=codec_type,codec_name,width,height,"
+    cmd = [system.ffprobe(), "-v", "error", "-show_entries",
+           "format=duration,start_time:stream=codec_type,codec_name,width,height,pix_fmt,"
            "avg_frame_rate,r_frame_rate,start_time,duration",
            "-of", "json", path]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = subprocess.run(cmd, capture_output=True, timeout=120, **system.TEXT, **system.popen_kw())
     except subprocess.TimeoutExpired:
         raise MediaError(f"ffprobe timed out on {path}")
+    except OSError as e:
+        raise MediaError(f"Could not run ffprobe ({e}). {system.install_hint()}")
     if out.returncode != 0:
         raise MediaError(f"ffprobe failed on {path}: {out.stderr.strip()[:300]}")
     data = json.loads(out.stdout or "{}")
@@ -80,7 +84,7 @@ def probe(path: str | os.PathLike) -> ProbeInfo:
         path=path, duration=duration, width=int(v.get("width") or 0),
         height=int(v.get("height") or 0), fps=fps, codec=v.get("codec_name", "?"),
         video_offset=max(0.0, vstart - fstart),
-        has_audio=any(s.get("codec_type") == "audio" for s in streams))
+        has_audio=any(s.get("codec_type") == "audio" for s in streams), pix_fmt=v.get("pix_fmt", ""))
 
 
 # --------------------------------------------------------------------------- clock
@@ -130,49 +134,67 @@ def grab_frame(path: str, t: float, width: int = 960, brighten: bool = True) -> 
     vf = f"scale='min({width},iw)':-2"
     if brighten:
         vf += ",eq=gamma=1.8"
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+    cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error",
            "-ss", f"{pre:.3f}", "-i", path, "-ss", f"{t - pre:.3f}",
            "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"]
     try:
-        out = subprocess.run(cmd, capture_output=True, timeout=60)
-    except subprocess.TimeoutExpired:
+        out = subprocess.run(cmd, capture_output=True, timeout=60, **system.popen_kw())
+    except (subprocess.TimeoutExpired, OSError):
         return None
     return out.stdout if out.returncode == 0 and out.stdout else None
 
 
-@lru_cache(maxsize=1)
-def drawtext_available() -> bool:
-    """True if this ffmpeg can render text (needs freetype + a font)."""
+_font_lock = threading.Lock()
+_font_cache: dict = {}
+
+
+def _drawtext_ok(font: Path | None) -> bool:
+    """Render one frame of text. Runs inside a temp dir with *relative* file names so
+    Windows paths (C:\\...) never appear inside the filter string."""
     with tempfile.TemporaryDirectory() as td:
-        tf = Path(td) / "t.txt"
-        tf.write_text("test %{pts:hms:1.0}")
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
-               "-i", "color=c=black:s=160x90:d=0.1", "-vf", f"drawtext=textfile={tf}:fontcolor=white",
-               "-frames:v", "1", "-f", "null", "-"]
+        (Path(td) / "t.txt").write_text("test %{pts:hms:1.0}", encoding="utf-8")
+        opt = "drawtext=textfile=t.txt:fontcolor=white"
+        if font is not None:
+            try:
+                shutil.copyfile(font, Path(td) / "font.ttf")
+            except OSError:
+                return False
+            opt += ":fontfile=font.ttf"
+        cmd = [system.ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+               "-i", "color=c=black:s=160x90:d=0.1", "-vf", opt, "-frames:v", "1", "-f", "null", "-"]
         try:
-            return subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
-        except Exception:
+            return subprocess.run(cmd, capture_output=True, timeout=30, cwd=td,
+                                  **system.popen_kw()).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
             return False
 
 
-def which_player() -> list[str] | None:
-    for p in ("mpv", "vlc", "celluloid"):
-        if shutil.which(p):
-            return [p]
-    if shutil.which("xdg-open"):
-        return ["xdg-open"]
-    return None
+def overlay_font() -> tuple[str, Path | None] | None:
+    """How to draw the compilation overlay.
+
+    ('default', None)  ffmpeg finds a font itself (fontconfig, typical on Linux)
+    ('file', path)     copy this TTF next to the job and pass fontfile=font.ttf
+    None               this ffmpeg can't draw text at all
+    """
+    key = (system.target(), system.ffmpeg())
+    with _font_lock:
+        if key in _font_cache:
+            return _font_cache[key]
+        files = system.font_files()
+        # Windows ffmpeg builds rarely have a working fontconfig, so try real font files first.
+        order = ([("file", f) for f in files] + [("default", None)] if system.is_windows()
+                 else [("default", None)] + [("file", f) for f in files])
+        res = None
+        for kind, f in order:
+            if _drawtext_ok(f):
+                res = (kind, f)
+                break
+        _font_cache[key] = res
+        return res
 
 
-def player_command(path: str, t: float = 0.0) -> list[str] | None:
-    p = which_player()
-    if not p:
-        return None
-    if p[0] == "mpv":
-        return ["mpv", f"--start={max(0.0, t):.2f}", "--force-window=yes", path]
-    if p[0] == "vlc":
-        return ["vlc", f"--start-time={max(0.0, t):.2f}", path]
-    return p + [path]
+def drawtext_available() -> bool:
+    return overlay_font() is not None
 
 
 def fmt_hms(t: float, ms: bool = False) -> str:

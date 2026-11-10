@@ -7,6 +7,7 @@ import sys
 import threading
 from pathlib import Path
 
+from . import gpu, system
 from .detector import Settings
 from .media import MediaError, fmt_hms
 from .pipeline import Callbacks, default_jobs, expand_inputs, run
@@ -27,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("gui", help="open the graphical interface (default)")
     sc = sub.add_parser("scan", help="analyse files/folders from the command line")
     sc.add_argument("inputs", nargs="+", help=".ts files and/or folders (searched recursively)")
+    _platform_args(sc)
     sc.add_argument("-o", "--out", default=".", help="output folder (a timestamped run folder is created inside)")
     sc.add_argument("--compile", action="store_true", help="also cut events into one compilation video")
     sc.add_argument("--fast", action="store_true", help="stream-copy clips (no overlay, keyframe-aligned)")
@@ -44,11 +46,34 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--no-auto-ignore", action="store_true", help="disable learning of constantly-changing areas")
     sc.add_argument("--clock", choices=["auto", "filename", "mtime", "none"], help="where wall-clock time comes from")
     sc.add_argument("-j", "--jobs", type=int, help=f"files analysed in parallel (default {default_jobs()})")
-    sc.add_argument("--hwaccel", action="store_true", help="try GPU video decoding (ffmpeg -hwaccel auto)")
     sc.add_argument("--fps", type=float, help="analysis frame rate (default 5)")
     sc.add_argument("--config", help="load settings from a JSON file (e.g. saved by the GUI)")
     sc.add_argument("--debug-video", action="store_true", help="write a mask/heatmap debug video per file")
+    ck = sub.add_parser("check", help="show which ffmpeg and GPU features will be used, then exit")
+    _platform_args(ck)
     return ap
+
+
+def _platform_args(p: argparse.ArgumentParser):
+    g = p.add_argument_group("platform")
+    g.add_argument("--platform", required=True, choices=system.PLATFORMS,
+                   help=f"operating system you're running on (required; this one looks like {system.REAL_OS})")
+    g.add_argument("--gpu", choices=gpu.VENDORS, default=None,
+                   help="graphics card to use for decoding/encoding (default auto: try the GPU, fall back to CPU)")
+    g.add_argument("--ffmpeg-dir", default=None, help="folder containing ffmpeg and ffprobe, if not on PATH")
+
+
+def _check(a) -> int:
+    for w in system.configure(a.platform, a.ffmpeg_dir or ""):
+        print("WARNING: " + w)
+    vendor = a.gpu or "auto"
+    print(f"Testing ({gpu.VENDOR_LABELS[vendor]})...\n")
+    rep = gpu.check(vendor)
+    print("\n".join(rep.lines()))
+    if rep.version is None:
+        print("\nffmpeg was not found. " + system.install_hint())
+        return 1
+    return 0
 
 
 def main(argv=None) -> int:
@@ -62,10 +87,22 @@ def main(argv=None) -> int:
     if a.cmd in (None, "gui"):
         from .gui import main as gui_main
         return gui_main()
+    for stream in (sys.stdout, sys.stderr):        # Windows consoles choke on non-ASCII file names
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    if a.cmd == "check":
+        return _check(a)
 
-    S = Settings(jobs=default_jobs())
+    S = Settings(jobs=default_jobs(), platform=a.platform)
     if a.config:
-        S = Settings.from_dict(json.loads(Path(a.config).read_text()))
+        S = Settings.from_dict(json.loads(Path(a.config).read_text(encoding="utf-8")))
+    S.platform = a.platform
+    if a.gpu:
+        S.gpu = a.gpu
+    if a.ffmpeg_dir is not None:
+        S.ffmpeg_dir = a.ffmpeg_dir
     for attr, val in [("sensitivity", a.sensitivity), ("min_object_pct", a.min_size),
                       ("pre_roll_s", a.pre), ("post_roll_s", a.post), ("merge_gap_s", a.merge_gap),
                       ("clock_source", a.clock), ("jobs", a.jobs), ("analysis_fps", a.fps)]:
@@ -77,7 +114,6 @@ def main(argv=None) -> int:
     S.fast_copy = a.fast or S.fast_copy
     S.keep_clips = a.keep_clips or S.keep_clips
     S.night_only = a.night_only or S.night_only
-    S.hwaccel = a.hwaccel or S.hwaccel
     if a.no_overlay:
         S.overlay = False
     if a.no_brighten:
@@ -117,15 +153,29 @@ def main(argv=None) -> int:
     cb = Callbacks(file_progress=fp, log=lg, stage=lambda s: lg(f"-- {s}"),
                    compile_progress=lambda f: tty and sys.stderr.write(f"\r  cutting... {f * 100:5.1f}%  "))
     cancel = threading.Event()
+    box: dict = {}
+
+    def work():
+        try:
+            box["out"] = run(files, S, a.out, cb, cancel, debug_video=a.debug_video)
+        except MediaError as e:
+            box["err"] = e
+
+    # Run in a thread and poll: Ctrl+C can't interrupt a blocking wait on Windows.
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
     try:
-        out = run(files, S, a.out, cb, cancel, debug_video=a.debug_video)
-    except MediaError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+        while t.is_alive():
+            t.join(0.3)
     except KeyboardInterrupt:
         cancel.set()
-        print("\ninterrupted", file=sys.stderr)
+        print("\ninterrupted, stopping ffmpeg...", file=sys.stderr)
+        t.join(10)
         return 130
+    if "err" in box:
+        print(f"error: {box['err']}", file=sys.stderr)
+        return 1
+    out = box["out"]
     if tty:
         sys.stderr.write("\r" + " " * 30 + "\r")
     for r in out.results:
