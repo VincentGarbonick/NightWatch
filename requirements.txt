@@ -1,0 +1,5 @@
+# Only needed for the venv route; on Arch prefer:
+#   sudo pacman -S --needed ffmpeg python-numpy python-opencv pyside6 mpv
+numpy>=1.24
+opencv-python-headless>=4.7
+PySide6>=6.5
